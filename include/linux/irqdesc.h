@@ -80,6 +80,8 @@ struct irq_desc {
 extern struct irq_desc irq_desc[NR_IRQS];
 #endif
 
+#ifdef CONFIG_GENERIC_HARDIRQS
+
 static inline struct irq_data *irq_desc_get_irq_data(struct irq_desc *desc)
 {
 	return &desc->irq_data;
@@ -156,14 +158,6 @@ static inline int irq_balancing_disabled(unsigned int irq)
 	return desc->status_use_accessors & IRQ_NO_BALANCING_MASK;
 }
 
-static inline int irq_is_percpu(unsigned int irq)
-{
-	struct irq_desc *desc;
-
-	desc = irq_to_desc(irq);
-	return desc->status_use_accessors & IRQ_PER_CPU;
-}
-
 static inline void
 irq_set_lockdep_class(unsigned int irq, struct lock_class_key *class)
 {
@@ -182,6 +176,7 @@ __irq_set_preflow_handler(unsigned int irq, irq_preflow_handler_t handler)
 	desc = irq_to_desc(irq);
 	desc->preflow_handler = handler;
 }
+#endif
 #endif
 
 #endif

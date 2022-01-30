@@ -14,7 +14,6 @@
 #include <linux/sched.h>
 #include <linux/kernel.h>
 #include <linux/mm.h>
-#include <linux/vmalloc.h>
 #include <linux/stddef.h>
 #include <linux/unistd.h>
 #include <linux/user.h>
@@ -33,7 +32,6 @@
 #include <linux/hw_breakpoint.h>
 #include <linux/cpuidle.h>
 #include <linux/leds.h>
-#include <linux/console.h>
 
 #include <asm/cacheflush.h>
 #include <asm/idmap.h>
@@ -41,7 +39,6 @@
 #include <asm/thread_notify.h>
 #include <asm/stacktrace.h>
 #include <asm/mach/time.h>
-#include <asm/tls.h>
 
 #ifdef CONFIG_CC_STACKPROTECTOR
 #include <linux/stackprotector.h>
@@ -60,45 +57,8 @@ static const char *isa_modes[] = {
   "ARM" , "Thumb" , "Jazelle", "ThumbEE"
 };
 
-#ifdef CONFIG_SMP
-void arch_trigger_all_cpu_backtrace(void)
-{
-	smp_send_all_cpu_backtrace();
-}
-#else
-void arch_trigger_all_cpu_backtrace(void)
-{
-	dump_stack();
-}
-#endif
-
 extern void call_with_stack(void (*fn)(void *), void *arg, void *sp);
 typedef void (*phys_reset_t)(unsigned long);
-
-#ifdef CONFIG_ARM_FLUSH_CONSOLE_ON_RESTART
-void arm_machine_flush_console(void)
-{
-	printk("\n");
-	pr_emerg("Restarting %s\n", linux_banner);
-	if (console_trylock()) {
-		console_unlock();
-		return;
-	}
-
-	mdelay(50);
-
-	local_irq_disable();
-	if (!console_trylock())
-		pr_emerg("arm_restart: Console was locked! Busting\n");
-	else
-		pr_emerg("arm_restart: Console was locked!\n");
-	console_unlock();
-}
-#else
-void arm_machine_flush_console(void)
-{
-}
-#endif
 
 /*
  * A temporary stack to use for CPU reset. This is static so that we
@@ -152,7 +112,7 @@ void soft_restart(unsigned long addr)
 	BUG();
 }
 
-static void null_restart(enum reboot_mode reboot_mode, const char *cmd)
+static void null_restart(char mode, const char *cmd)
 {
 }
 
@@ -162,7 +122,7 @@ static void null_restart(enum reboot_mode reboot_mode, const char *cmd)
 void (*pm_power_off)(void);
 EXPORT_SYMBOL(pm_power_off);
 
-void (*arm_pm_restart)(enum reboot_mode reboot_mode, const char *cmd) = null_restart;
+void (*arm_pm_restart)(char str, const char *cmd) = null_restart;
 EXPORT_SYMBOL_GPL(arm_pm_restart);
 
 /*
@@ -187,7 +147,6 @@ void arch_cpu_idle_prepare(void)
 
 void arch_cpu_idle_enter(void)
 {
-	idle_notifier_call_chain(IDLE_START);
 	ledtrig_cpu(CPU_LED_IDLE_START);
 #ifdef CONFIG_PL310_ERRATA_769419
 	wmb();
@@ -197,7 +156,6 @@ void arch_cpu_idle_enter(void)
 void arch_cpu_idle_exit(void)
 {
 	ledtrig_cpu(CPU_LED_IDLE_END);
-	idle_notifier_call_chain(IDLE_END);
 }
 
 #ifdef CONFIG_HOTPLUG_CPU
@@ -216,14 +174,14 @@ void arch_cpu_idle(void)
 		default_idle();
 }
 
-enum reboot_mode reboot_mode = REBOOT_HARD;
+static char reboot_mode = 'h';
 
-static int __init reboot_setup(char *str)
+int __init reboot_setup(char *str)
 {
-	if ('s' == str[0])
-		reboot_mode = REBOOT_SOFT;
+	reboot_mode = str[0];
 	return 1;
 }
+
 __setup("reboot=", reboot_setup);
 
 /*
@@ -237,16 +195,6 @@ __setup("reboot=", reboot_setup);
  */
 void machine_shutdown(void)
 {
-#ifdef CONFIG_SMP
-	/*
-	 * Disable preemption so we're guaranteed to
-	 * run to power off or reboot and prevent
-	 * the possibility of switching to another
-	 * thread that might wind up blocking on
-	 * one of the stopped CPUs.
-	 */
-	preempt_disable();
-#endif
 	disable_nonboot_cpus();
 }
 
@@ -257,7 +205,6 @@ void machine_shutdown(void)
  */
 void machine_halt(void)
 {
-	preempt_disable();
 	smp_send_stop();
 
 	local_irq_disable();
@@ -272,7 +219,6 @@ void machine_halt(void)
  */
 void machine_power_off(void)
 {
-	preempt_disable();
 	smp_send_stop();
 
 	if (pm_power_off)
@@ -292,12 +238,7 @@ void machine_power_off(void)
  */
 void machine_restart(char *cmd)
 {
-	preempt_disable();
 	smp_send_stop();
-
-	/* Flush the console to make sure all the relevant messages make it
-	 * out to the console drivers */
-	arm_machine_flush_console();
 
 	arm_pm_restart(reboot_mode, cmd);
 
@@ -308,77 +249,6 @@ void machine_restart(char *cmd)
 	printk("Reboot failed -- System halted\n");
 	local_irq_disable();
 	while (1);
-}
-
-/*
- * dump a block of kernel memory from around the given address
- */
-static void show_data(unsigned long addr, int nbytes, const char *name)
-{
-	int	i, j;
-	int	nlines;
-	u32	*p;
-
-	/*
-	 * don't attempt to dump non-kernel addresses or
-	 * values that are probably just small negative numbers
-	 */
-	if (addr < PAGE_OFFSET || addr > -256UL)
-		return;
-
-	printk("\n%s: %#lx:\n", name, addr);
-
-	/*
-	 * round address down to a 32 bit boundary
-	 * and always dump a multiple of 32 bytes
-	 */
-	p = (u32 *)(addr & ~(sizeof(u32) - 1));
-	nbytes += (addr & (sizeof(u32) - 1));
-	nlines = (nbytes + 31) / 32;
-
-
-	for (i = 0; i < nlines; i++) {
-		/*
-		 * just display low 16 bits of address to keep
-		 * each line of the dump < 80 characters
-		 */
-		printk("%04lx ", (unsigned long)p & 0xffff);
-		for (j = 0; j < 8; j++) {
-			u32	data;
-			/*
-			 * vmalloc addresses may point to
-			 * memory-mapped peripherals
-			 */
-			if (!virt_addr_valid(p) ||
-			    probe_kernel_address(p, data)) {
-				printk(" ********");
-			} else {
-				printk(KERN_CONT " %08x", data);
-			}
-			++p;
-		}
-		printk(KERN_CONT "\n");
-	}
-}
-
-static void show_extra_register_data(struct pt_regs *regs, int nbytes)
-{
-	show_data(regs->ARM_pc - nbytes, nbytes * 2, "PC");
-	show_data(regs->ARM_lr - nbytes, nbytes * 2, "LR");
-	show_data(regs->ARM_sp - nbytes, nbytes * 2, "SP");
-	show_data(regs->ARM_ip - nbytes, nbytes * 2, "IP");
-	show_data(regs->ARM_fp - nbytes, nbytes * 2, "FP");
-	show_data(regs->ARM_r0 - nbytes, nbytes * 2, "R0");
-	show_data(regs->ARM_r1 - nbytes, nbytes * 2, "R1");
-	show_data(regs->ARM_r2 - nbytes, nbytes * 2, "R2");
-	show_data(regs->ARM_r3 - nbytes, nbytes * 2, "R3");
-	show_data(regs->ARM_r4 - nbytes, nbytes * 2, "R4");
-	show_data(regs->ARM_r5 - nbytes, nbytes * 2, "R5");
-	show_data(regs->ARM_r6 - nbytes, nbytes * 2, "R6");
-	show_data(regs->ARM_r7 - nbytes, nbytes * 2, "R7");
-	show_data(regs->ARM_r8 - nbytes, nbytes * 2, "R8");
-	show_data(regs->ARM_r9 - nbytes, nbytes * 2, "R9");
-	show_data(regs->ARM_r10 - nbytes, nbytes * 2, "R10");
 }
 
 void __show_regs(struct pt_regs *regs)
@@ -437,8 +307,6 @@ void __show_regs(struct pt_regs *regs)
 		printk("Control: %08x%s\n", ctrl, buf);
 	}
 #endif
-	if (get_fs() == get_ds())
-		show_extra_register_data(regs, 128);
 }
 
 void show_regs(struct pt_regs * regs)
@@ -506,8 +374,7 @@ copy_thread(unsigned long clone_flags, unsigned long stack_start,
 	clear_ptrace_hw_breakpoint(p);
 
 	if (clone_flags & CLONE_SETTLS)
-		thread->tp_value[0] = childregs->ARM_r3;
-	thread->tp_value[1] = get_tpuser();
+		thread->tp_value = childregs->ARM_r3;
 
 	thread_notify(THREAD_NOTIFY_COPY, thread);
 
@@ -609,14 +476,9 @@ int in_gate_area_no_mm(unsigned long addr)
 
 const char *arch_vma_name(struct vm_area_struct *vma)
 {
-	if (is_gate_vma(vma))
-		return "[vectors]";
-	else if (vma->vm_mm && vma->vm_start == vma->vm_mm->context.sigpage)
-		return "[sigpage]";
-	else if (vma == get_user_timers_vma(NULL))
-		return "[timers]";
-	else
-		return NULL;
+	return is_gate_vma(vma) ? "[vectors]" :
+		(vma->vm_mm && vma->vm_start == vma->vm_mm->context.sigpage) ?
+		 "[sigpage]" : NULL;
 }
 
 static struct page *signal_page;

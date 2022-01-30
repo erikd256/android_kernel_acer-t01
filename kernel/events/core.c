@@ -157,11 +157,7 @@ static struct srcu_struct pmus_srcu;
  *   1 - disallow cpu events for unpriv
  *   2 - disallow kernel profiling for unpriv
  */
-#ifdef CONFIG_PERF_EVENTS_USERMODE
-int sysctl_perf_event_paranoid __read_mostly = -1;
-#else
 int sysctl_perf_event_paranoid __read_mostly = 1;
-#endif
 
 /* Minimum for 512 kiB + 1 user control page */
 int sysctl_perf_event_mlock __read_mostly = 512 + (PAGE_SIZE / 1024); /* 'free' kiB per user */
@@ -1357,28 +1353,6 @@ static int __perf_remove_from_context(void *info)
 	return 0;
 }
 
-#ifdef CONFIG_SMP
-static void perf_retry_remove(struct remove_event *rep)
-{
-	int up_ret;
-	struct perf_event *event = rep->event;
-	/*
-	 * CPU was offline. Bring it online so we can
-	 * gracefully exit a perf context.
-	 */
-	up_ret = cpu_up(event->cpu);
-	if (!up_ret)
-		/* Try the remove call once again. */
-		cpu_function_call(event->cpu, __perf_remove_from_context, rep);
-	else
-		pr_err("Failed to bring up CPU: %d, ret: %d\n",
-		       event->cpu, up_ret);
-}
-#else
-static void perf_retry_remove(struct remove_event *rep)
-{
-}
-#endif
 
 /*
  * Remove the event from a task's (or a CPU's) list of events.
@@ -1393,11 +1367,10 @@ static void perf_retry_remove(struct remove_event *rep)
  * When called from perf_event_exit_task, it's OK because the
  * context has been detached from its task.
  */
-static void __ref perf_remove_from_context(struct perf_event *event, bool detach_group)
+static void perf_remove_from_context(struct perf_event *event, bool detach_group)
 {
 	struct perf_event_context *ctx = event->ctx;
 	struct task_struct *task = ctx->task;
-	int ret;
 	struct remove_event re = {
 		.event = event,
 		.detach_group = detach_group,
@@ -1407,12 +1380,10 @@ static void __ref perf_remove_from_context(struct perf_event *event, bool detach
 
 	if (!task) {
 		/*
-		 * Per cpu events are removed via an smp call
+		 * Per cpu events are removed via an smp call and
+		 * the removal is always successful.
 		 */
-		ret = cpu_function_call(event->cpu, __perf_remove_from_context,
-					&re);
-		if (ret == -ENXIO)
-			perf_retry_remove(&re);
+		cpu_function_call(event->cpu, __perf_remove_from_context, &re);
 		return;
 	}
 
@@ -3199,16 +3170,6 @@ static void put_event(struct perf_event *event)
 
 static int perf_release(struct inode *inode, struct file *file)
 {
-	struct perf_event *event = file->private_data;
-
-	/*
-	 * Event can be in state OFF because of a constraint check.
-	 * Change to ACTIVE so that it gets cleaned up correctly.
-	 */
-	if ((event->state == PERF_EVENT_STATE_OFF) &&
-	    event->attr.constraint_duplicate)
-		event->state = PERF_EVENT_STATE_ACTIVE;
-
 	put_event(file->private_data);
 	return 0;
 }
@@ -5621,7 +5582,6 @@ static struct pmu perf_swevent = {
 	.read		= perf_swevent_read,
 
 	.event_idx	= perf_swevent_event_idx,
-	.events_across_hotplug = 1,
 };
 
 #ifdef CONFIG_EVENT_TRACING
@@ -5741,7 +5701,6 @@ static struct pmu perf_tracepoint = {
 	.read		= perf_swevent_read,
 
 	.event_idx	= perf_swevent_event_idx,
-	.events_across_hotplug = 1,
 };
 
 static inline void perf_tp_register(void)
@@ -5969,7 +5928,6 @@ static struct pmu perf_cpu_clock = {
 	.read		= cpu_clock_event_read,
 
 	.event_idx	= perf_swevent_event_idx,
-	.events_across_hotplug = 1,
 };
 
 /*
@@ -6050,7 +6008,6 @@ static struct pmu perf_task_clock = {
 	.read		= task_clock_event_read,
 
 	.event_idx	= perf_swevent_event_idx,
-	.events_across_hotplug = 1,
 };
 
 static void perf_pmu_nop_void(struct pmu *pmu)
@@ -7573,18 +7530,6 @@ static void __perf_event_exit_context(void *__info)
 	rcu_read_unlock();
 }
 
-static void __perf_event_stop_swclock(void *__info)
-{
-	struct perf_event_context *ctx = __info;
-	struct perf_event *event, *tmp;
-
-	list_for_each_entry_safe(event, tmp, &ctx->event_list, event_entry) {
-		if (event->attr.config == PERF_COUNT_SW_CPU_CLOCK &&
-				event->attr.type == PERF_TYPE_SOFTWARE)
-			cpu_clock_event_stop(event, 0);
-	}
-}
-
 static void perf_event_exit_cpu_context(int cpu)
 {
 	struct perf_event_context *ctx;
@@ -7594,46 +7539,10 @@ static void perf_event_exit_cpu_context(int cpu)
 	idx = srcu_read_lock(&pmus_srcu);
 	list_for_each_entry_rcu(pmu, &pmus, entry) {
 		ctx = &per_cpu_ptr(pmu->pmu_cpu_context, cpu)->ctx;
+
 		mutex_lock(&ctx->mutex);
-		/*
-		 * If keeping events across hotplugging is supported, do not
-		 * remove the event list, but keep it alive across CPU hotplug.
-		 * The context is exited via an fd close path when userspace
-		 * is done and the target CPU is online. If software clock
-		 * event is active, then stop hrtimer associated with it.
-		 * Start the timer when the CPU comes back online.
-		 */
-		if (!pmu->events_across_hotplug)
-			smp_call_function_single(cpu, __perf_event_exit_context,
-						 ctx, 1);
-		else
-			smp_call_function_single(cpu, __perf_event_stop_swclock,
-						 ctx, 1);
+		smp_call_function_single(cpu, __perf_event_exit_context, ctx, 1);
 		mutex_unlock(&ctx->mutex);
-	}
-	srcu_read_unlock(&pmus_srcu, idx);
-}
-
-static void perf_event_start_swclock(int cpu)
-{
-	struct perf_event_context *ctx;
-	struct pmu *pmu;
-	int idx;
-	struct perf_event *event, *tmp;
-
-	idx = srcu_read_lock(&pmus_srcu);
-	list_for_each_entry_rcu(pmu, &pmus, entry) {
-		if (pmu->events_across_hotplug) {
-			ctx = &per_cpu_ptr(pmu->pmu_cpu_context, cpu)->ctx;
-			list_for_each_entry_safe(event, tmp, &ctx->event_list,
-							event_entry) {
-				if (event->attr.config ==
-						PERF_COUNT_SW_CPU_CLOCK &&
-						event->attr.type ==
-							PERF_TYPE_SOFTWARE)
-					cpu_clock_event_start(event, 0);
-			}
-		}
 	}
 	srcu_read_unlock(&pmus_srcu, idx);
 }
@@ -7651,7 +7560,6 @@ static void perf_event_exit_cpu(int cpu)
 }
 #else
 static inline void perf_event_exit_cpu(int cpu) { }
-static inline void perf_event_start_swclock(int cpu) { }
 #endif
 
 static int
@@ -7689,10 +7597,6 @@ perf_cpu_notify(struct notifier_block *self, unsigned long action, void *hcpu)
 	case CPU_UP_CANCELED:
 	case CPU_DOWN_PREPARE:
 		perf_event_exit_cpu(cpu);
-		break;
-
-	case CPU_STARTING:
-		perf_event_start_swclock(cpu);
 		break;
 
 	default:
