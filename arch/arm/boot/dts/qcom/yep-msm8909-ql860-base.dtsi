@@ -11,12 +11,12 @@
  */
 
  
-#include "yep-msm8909-ql861.dtsi"
-#include "yep-msm8909-ql861-camera.dtsi"
-#include "yep-msm8909-ql861-lcd-panels.dtsi"
-#include "yep-msm8909-ql861-lcd-panel-settings.dtsi"
-#include "yep-msm8909-ql861-tp.dtsi"
-#include "yep-msm8909-ql861-sensors.dtsi"
+#include "yep-msm8909-ql860.dtsi"
+#include "yep-msm8909-ql860-camera.dtsi"
+#include "yep-msm8909-ql860-lcd-panels.dtsi"
+#include "yep-msm8909-ql860-lcd-panel-settings.dtsi"
+#include "yep-msm8909-ql860-tp.dtsi"
+#include "yep-msm8909-ql860-sensors.dtsi"
 
 / {
 	model = "Qualcomm Technologies, Inc. MSM8909 QRD SKUC";
